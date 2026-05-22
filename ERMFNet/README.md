@@ -19,7 +19,7 @@
 #### 1.Environment configuration
 
 ```
-git clone https://github.com/1/ERFMNet.git
+git clone https://github.com/tian1-web/1/tree/main/ERMFNet
 pip install -r requirements.txt  # install
 ```
 

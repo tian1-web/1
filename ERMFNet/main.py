@@ -22,37 +22,28 @@ from torch.autograd import Variable
 import os
 
 
-# ==================== 通道注意力模块 ====================
-class FC_Block(nn.Module):
-    """通道注意力模块"""
+'''class FC_Block(nn.Module):
 
-    def __init__(self, inplanes, planes):
+    def __init__(self, channels, ratio=16):
         super(FC_Block, self).__init__()
-        self.fc1 = nn.Linear(inplanes, planes)
-        self.fc2 = nn.Linear(planes, inplanes)
-        self.relu = nn.ReLU(inplace=True)
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc_layers = nn.Sequential(
+            nn.Linear(channels, channels // ratio, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // ratio, channels, bias=False),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        x = x.view(x.size(0), -1)
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.fc2(x)
-        return x.view(x.size(0), -1, 1, 1)
+        b, c, _, _ = x.shape
+        # 全局平均池化
+        v = self.global_pool(x).view(b, c)
+        # 通道注意力权重
+        weights = self.fc_layers(v).view(b, c, 1, 1)
+        return x * weights'''
 
 
-# ==================== 混合MSFRF-DST融合模块 ====================
 class HybridMSFRF_DST(nn.Module):
-    """
-    混合融合策略：
-    - 主路径：MSFRF多尺度特征融合（保证性能）
-    - 辅助路径：DST证据理论（提供不确定性估计和额外监督）
-
-    优势：
-    1. 保留MSFRF的强大特征融合能力
-    2. 引入DST的不确定性量化能力
-    3. 通过辅助监督提升模型鲁棒性
-    4. 提供可解释的置信度估计
-    """
 
     def __init__(self, channels=128, num_classes=3, r=4, num_heads=4):
         super(HybridMSFRF_DST, self).__init__()
@@ -60,8 +51,7 @@ class HybridMSFRF_DST(nn.Module):
         self.num_classes = num_classes
         inter_channels = int(channels // r)
 
-        # ========== 主路径：MSFRF组件 ==========
-        # 图像分支的局部注意力
+
         self.local_att_img = nn.Sequential(
             nn.Conv2d(channels, inter_channels, kernel_size=1, stride=1, padding=0),
             nn.BatchNorm2d(inter_channels),
@@ -70,7 +60,7 @@ class HybridMSFRF_DST(nn.Module):
             nn.BatchNorm2d(channels),
         )
 
-        # 音频分支的局部注意力
+
         self.local_att_aud = nn.Sequential(
             nn.Conv2d(channels, inter_channels, kernel_size=1, stride=1, padding=0),
             nn.BatchNorm2d(inter_channels),
@@ -79,25 +69,19 @@ class HybridMSFRF_DST(nn.Module):
             nn.BatchNorm2d(channels),
         )
 
-        # 1D卷积（时序建模）
-        self.conv_img = nn.Conv1d(1, 1, kernel_size=3, padding=1, bias=False)
-        self.conv_aud = nn.Conv1d(1, 1, kernel_size=3, padding=1, bias=False)
-        self.bn_img = nn.BatchNorm2d(channels)
-        self.bn_aud = nn.BatchNorm2d(channels)
 
-        # 通道注意力
-        self.channel_att_img = FC_Block(channels, 16)
-        self.channel_att_aud = FC_Block(channels, 16)
+        #self.channel_att_img = FC_Block(channels, 16)
+        #self.channel_att_aud = FC_Block(channels, 16)
 
-        # 交叉注意力（跨模态交互）
+
         self.cross_att = nn.MultiheadAttention(
             embed_dim=channels,
             num_heads=num_heads,
             batch_first=True
         )
 
-        # 门控机制
-        self.gate_img = nn.Sequential(
+
+        '''self.gate_img = nn.Sequential(
             nn.Conv2d(channels * 2, channels, kernel_size=1),
             nn.Sigmoid()
         )
@@ -105,8 +89,14 @@ class HybridMSFRF_DST(nn.Module):
             nn.Conv2d(channels * 2, channels, kernel_size=1),
             nn.Sigmoid()
         )
+        self.gate_net = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, 2, kernel_size=1),
+            nn.Softmax(dim=1)  # 自动确保权重和为1
+        )'''
 
-        # ========== 辅助路径：轻量级DST组件 ==========
+
         # 证据生成网络
         self.img_evidence_net = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -213,35 +203,14 @@ class HybridMSFRF_DST(nn.Module):
         return combined_alpha
 
     def forward(self, img_feat, aud_feat):
-        """
-        前向传播
 
-        Args:
-            img_feat: [B, 128, 1, 1] 图像特征
-            aud_feat: [B, 128, 1, 1] 音频特征
-
-        Returns:
-            fused_feat: [B, 128, 1, 1] 融合后的特征（主输出）
-            fusion_info: dict 包含DST相关信息（辅助输出）
-        """
         B = img_feat.size(0)
 
-        # ==================== 主路径：MSFRF特征增强 ====================
-        # 阶段1：特征交叉增强
-        xa_img = img_feat + aud_feat  # 图像特征 + 音频残差
-        xa_aud = aud_feat + img_feat  # 音频特征 + 图像残差
 
-        # 阶段2：局部注意力
-        img_local = self.local_att_img(xa_img)
-        aud_local = self.local_att_aud(xa_aud)
 
-        # 阶段3：1D卷积（时序建模）
-        img_conv = self.conv_img(xa_img.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
-        img_conv = self.bn_img(img_conv)
-        aud_conv = self.conv_aud(xa_aud.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
-        aud_conv = self.bn_aud(aud_conv)
+        img_local = self.local_att_img(img_feat + aud_feat)
+        aud_local = self.local_att_aud(aud_feat + img_feat)
 
-        # 阶段4：交叉注意力（跨模态交互）
         img_flat = img_feat.view(B, self.channels, -1).transpose(1, 2)  # [B, HW, C]
         aud_flat = aud_feat.view(B, self.channels, -1).transpose(1, 2)
 
@@ -251,24 +220,16 @@ class HybridMSFRF_DST(nn.Module):
         cross_aud, _ = self.cross_att(aud_flat, img_flat, img_flat)  # Q=aud, K/V=img
         cross_aud = cross_aud.transpose(1, 2).view(B, self.channels, 1, 1)
 
-        # 阶段5：门控融合
-        gate_img = self.gate_img(torch.cat([img_feat, aud_feat], dim=1))
-        gate_aud = self.gate_aud(torch.cat([aud_feat, img_feat], dim=1))
+        fusion_img = img_local + cross_img
+        fusion_aud = aud_local + cross_aud
 
-        # 阶段6：多尺度特征融合
-        fusion_img = img_local + img_conv + cross_img
-        fusion_aud = aud_local + aud_conv + cross_aud
+        img_enhanced = fusion_img + img_feat
+        aud_enhanced = fusion_aud + aud_feat
 
-        # 阶段7：通道注意力
-        wei_img = self.sigmoid(self.channel_att_img(fusion_img))
-        wei_aud = self.sigmoid(self.channel_att_aud(fusion_aud))
+        #img_enhanced = self.channel_att_img(fusion_img)
+        #aud_enhanced = self.channel_att_aud(fusion_aud)
 
-        # 阶段8：最终增强特征
-        img_enhanced = img_feat * gate_img + aud_feat * (1 - gate_img) + wei_img * fusion_img
-        aud_enhanced = aud_feat * gate_aud + img_feat * (1 - gate_aud) + wei_aud * fusion_aud
 
-        # ==================== 辅助路径：DST证据融合 ====================
-        # 全局特征提取
         img_global = F.adaptive_avg_pool2d(img_enhanced, 1).view(B, -1)
         aud_global = F.adaptive_avg_pool2d(aud_enhanced, 1).view(B, -1)
 
@@ -303,7 +264,7 @@ class HybridMSFRF_DST(nn.Module):
         S = alpha_fused.sum(dim=1, keepdim=True)
         prob = alpha_fused / S  # 预测概率
 
-        # ==================== 自适应融合策略 ====================
+
         # 构建决策输入：不确定性 + 冲突度 + 可靠性差异
         reliability_diff = torch.abs(reliability_img - reliability_aud)
         decision_input = torch.cat([
@@ -318,8 +279,7 @@ class HybridMSFRF_DST(nn.Module):
         w_img = adaptive_weights[:, 0:1].view(B, 1, 1, 1)
         w_aud = adaptive_weights[:, 1:2].view(B, 1, 1, 1)
 
-        # ==================== 主输出：融合特征 ====================
-        # 策略：使用自适应权重融合增强后的特征
+
         fused_feat = w_img * img_enhanced + w_aud * aud_enhanced
 
         # ==================== 返回结果 ====================
@@ -348,7 +308,7 @@ class HybridMSFRF_DST(nn.Module):
         return fused_feat, fusion_info
 
 
-# ==================== 混合损失函数 ====================
+
 class HybridLoss(nn.Module):
     """
     混合损失函数：
@@ -463,6 +423,7 @@ class HybridLoss(nn.Module):
         return total_loss, loss_dict
 
 
+
 # ==================== 完整网络 ====================
 class AVENet_Hybrid(nn.Module):
     """使用混合MSFRF-DST融合的网络"""
@@ -513,6 +474,7 @@ class AVENet_Hybrid(nn.Module):
         out = self.fc3(out)
 
         return out, img, aud, fusion_info
+
 
     def get_image_embeddings(self, image):
         img = self.imgnet(image)
@@ -669,6 +631,8 @@ class testConfusionMatrix(object):
         plt.show()
 
 
+
+
 class LossAverageMeter(object):
     def __init__(self):
         self.reset()
@@ -782,7 +746,7 @@ def getAVENet(use_cuda):
 
 
 # ==================== Demo函数 ====================
-def demo():
+'''def demo():
     """测试模型"""
     model = AVENet_Hybrid()
     image = Variable(torch.rand(2, 3, 224, 224))
@@ -800,11 +764,169 @@ def demo():
     print(f"不确定性: {fusion_info['uncertainty'][0].item():.3f}")
     print(f"自适应权重: 图像={fusion_info['adaptive_weights'][0, 0].item():.3f}, "
           f"音频={fusion_info['adaptive_weights'][0, 1].item():.3f}")
-    print(f"预测概率: {fusion_info['prob'][0]}")
+    print(f"预测概率: {fusion_info['prob'][0]}")'''
+
+
+def demo():
+    """测试完整的证据融合模型 - 使用真实测试集的第一个样本"""
+
+    # 加载模型和训练好的权重
+    model = AVENet_Hybrid()
+    model_name = r'/root/1/ERMFNet/model_save/2_hybrid_best_model.pt'
+
+    if os.path.exists(model_name):
+        model.load_state_dict(torch.load(model_name), strict=False)
+        print(f" 成功加载训练好的模型权重: {model_name}")
+    else:
+        print("  使用随机初始化权重")
+
+    # 加载测试数据集
+    testdataset = Mydata(
+        img_speed_path=r'/root/1/ERMFNet/second/test.txt',
+        img_path=r'/root/1/ERMFNet/dataset_second/test/img',
+        speed_path=r'/root/1/ERMFNet/dataset_second/test/speed'
+    )
+
+    print(f" 测试集大小: {len(testdataset)} 个样本")
+
+    # 获取第一个真实样本
+    img, aud, true_label = testdataset[2000]
+
+    # 添加batch维度
+    image = Variable(img.unsqueeze(0))  # [1, 3, 224, 224]
+    audio = Variable(aud.unsqueeze(0))  # [1, 1, 257, 200]
+
+    # 真实标签
+    true_label = true_label.item()
+    class_names = ['Normal', 'Aggressive', 'Drowsy']
+    true_class_name = class_names[true_label]
+
+    print(f" 测试样本信息:")
+    print(f"   真实标签: {true_class_name} (索引: {true_label})")
+    print(f"   图像形状: {image.shape}")
+    print(f"   音频形状: {audio.shape}")
+
+    model.eval()
+
+    # 前向传播 - 获取所有输出
+    with torch.no_grad():
+        out, v, a, fusion_info = model(image, audio)
+
+    # 获取预测结果
+    pred_prob = F.softmax(out, 1)
+    pred_class = torch.argmax(pred_prob, 1).item()
+    pred_class_name = class_names[pred_class]
+    confidence = pred_prob[0][pred_class].item()
+
+    print("\n" + "=" * 60)
+    print("模型输出形状信息:")
+    print("=" * 60)
+    print(f"输入图像: {image.shape}")
+    print(f"输入音频: {audio.shape}")
+    print(f"视觉特征: {v.shape}")
+    print(f"音频特征: {a.shape}")
+    print(f"分类输出: {out.shape}")
+    print(f"融合信息键值: {list(fusion_info.keys())}")
+
+    print("\n" + "=" * 60)
+    print("预测结果:")
+    print("=" * 60)
+    print(f"真实类别: {true_class_name} (索引: {true_label})")
+    print(f"预测类别: {pred_class_name} (索引: {pred_class})")
+    print(f"预测置信度: {confidence:.4f}")
+    print(f"结果: {' 预测正确' if pred_class == true_label else ' 预测错误'}")
+
+    print("\n" + "=" * 60)
+    print("DST证据融合详细信息:")
+    print("=" * 60)
+
+    # 获取第一个样本的信息
+    idx = 0
+
+    print(f"\n--- 可靠性评估 ---")
+    print(f"图像可靠性: {fusion_info['reliability_img'][idx].item():.4f}")
+    print(f"音频可靠性: {fusion_info['reliability_aud'][idx].item():.4f}")
+
+    print(f"\n--- 不确定性分析 ---")
+    print(f"图像不确定性: {fusion_info['uncertainty_img'][idx].item():.4f}")
+    print(f"音频不确定性: {fusion_info['uncertainty_aud'][idx].item():.4f}")
+    print(f"融合后不确定性: {fusion_info['uncertainty'][idx].item():.4f}")
+
+    # 计算不确定性降低效果
+    avg_individual_uncertainty = (fusion_info['uncertainty_img'][idx].item() +
+                                  fusion_info['uncertainty_aud'][idx].item()) / 2
+    uncertainty_reduction = avg_individual_uncertainty - fusion_info['uncertainty'][idx].item()
+    print(f"不确定性降低: {uncertainty_reduction:.4f}")
+
+    print(f"\n--- 冲突度分析 ---")
+    conflict = fusion_info['conflict'][idx].item()
+    print(f"模态间冲突度: {conflict:.4f}")
+    if conflict < 0.1:
+        print(f"冲突程度: 低 (模态一致)")
+    elif conflict < 0.3:
+        print(f"冲突程度: 中")
+    else:
+        print(f"冲突程度: 高 (模态冲突)")
+
+    print(f"\n--- 自适应权重 ---")
+    weights = fusion_info['adaptive_weights'][idx]
+    img_weight = weights[0].item()
+    aud_weight = weights[1].item()
+    print(f"图像权重: {img_weight:.4f}")
+    print(f"音频权重: {aud_weight:.4f}")
+    dominant_modality = "图像" if img_weight > aud_weight else "音频"
+    print(f"主导模态: {dominant_modality}")
+
+    print(f"\n--- 证据强度 ---")
+    print(f"原始图像证据: {[f'{x:.4f}' for x in fusion_info['evidence_img'][idx].tolist()]}")
+    print(f"原始音频证据: {[f'{x:.4f}' for x in fusion_info['evidence_aud'][idx].tolist()]}")
+    print(f"折扣后图像证据: {[f'{x:.4f}' for x in fusion_info['evidence_img_discounted'][idx].tolist()]}")
+    print(f"折扣后音频证据: {[f'{x:.4f}' for x in fusion_info['evidence_aud_discounted'][idx].tolist()]}")
+
+    # 证据强度分析
+    img_evidence_strength = fusion_info['evidence_img'][idx].sum().item()
+    aud_evidence_strength = fusion_info['evidence_aud'][idx].sum().item()
+    print(f"图像证据总强度: {img_evidence_strength:.4f}")
+    print(f"音频证据总强度: {aud_evidence_strength:.4f}")
+
+    print(f"\n--- 最终预测 ---")
+    print(f"融合后概率: {[f'{x:.4f}' for x in fusion_info['prob'][idx].tolist()]}")
+    print(f"融合后信念: {[f'{x:.4f}' for x in fusion_info['belief'][idx].tolist()]}")
+    print(f"Dirichlet参数: {[f'{x:.4f}' for x in fusion_info['alpha'][idx].tolist()]}")
+
+    # 信念和不确定性分布
+    total_mass = fusion_info['belief'][idx].sum().item() + fusion_info['uncertainty'][idx].item()
+    print(f"信念+不确定性总和: {total_mass:.4f} (应该接近1.0)")
+
+    print(f"\n--- 决策分析 ---")
+    max_belief = fusion_info['belief'][idx].max().item()
+    uncertainty = fusion_info['uncertainty'][idx].item()
+    decision_confidence = max_belief / (max_belief + uncertainty)
+    print(f"决策置信度分数: {decision_confidence:.4f}")
+
+    if decision_confidence > 0.7:
+        print(f"决策质量:  高置信度")
+    elif decision_confidence > 0.5:
+        print(f"决策质量:   中等置信度")
+    else:
+        print(f"决策质量:  低置信度")
+
+    return {
+        'model': model,
+        'fusion_info': fusion_info,
+        'image': image,
+        'audio': audio,
+        'true_label': true_label,
+        'pred_class': pred_class,
+        'confidence': confidence,
+        'is_correct': pred_class == true_label
+    }
+
+
 
 
 # ==================== 主训练函数 ====================
-def main(use_cuda=True, EPOCHS=200, batch_size=8, model_name="1_hybrid_model.pt"):
+def main(use_cuda=True, EPOCHS=200, batch_size=8, model_name="6_hybrid_model.pt"):
     """
     混合MSFRF-DST训练函数
     """
@@ -814,18 +936,19 @@ def main(use_cuda=True, EPOCHS=200, batch_size=8, model_name="1_hybrid_model.pt"
     benchmark_fps(model, use_cuda=use_cuda)
 
     checkpoint_dir = r'/root/1/ERMFNet/model_save'
+    #checkpoint_dir = r'E:\python\pythonProject5\ERMFNet\model_save'
 
     # 加载预训练模型
     model_path = os.path.join(checkpoint_dir, model_name)
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path))
-        print("✅ Loading from previous checkpoint.")
+        print("Loading from previous checkpoint.")
     else:
-        print("🆕 Training from scratch.")
+        print("Training from scratch.")
 
     # 数据集加载
     print("\n" + "=" * 80)
-    print("📊 Loading Datasets...")
+    print("Loading Datasets...")
     print("=" * 80)
 
     dataset = Mydata(
@@ -837,14 +960,16 @@ def main(use_cuda=True, EPOCHS=200, batch_size=8, model_name="1_hybrid_model.pt"
     valdataset = Mydata(
         img_speed_path=r'/root/1/ERMFNet/total/val.txt',
         img_path=r'/root/1/ERMFNet/dataset_total/val/img',
-        speed_path=r'/root/1/ERMFNet/dataset_total/val/speed'
+        speed_path=r'/root/1/GERMFNet/dataset_total/val/speed'
     )
+
+
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2)
     valdataloader = DataLoader(valdataset, batch_size=batch_size, shuffle=True, num_workers=2)
 
-    print(f"✅ Training samples: {len(dataset)}")
-    print(f"✅ Validation samples: {len(valdataset)}")
+    print(f"Training samples: {len(dataset)}")
+    print(f"Validation samples: {len(valdataset)}")
 
     # 损失函数和优化器
     criterion = HybridLoss(
@@ -853,12 +978,13 @@ def main(use_cuda=True, EPOCHS=200, batch_size=8, model_name="1_hybrid_model.pt"
         lambda_conflict=0.01,
         lambda_reliability=0.02
     )
+
     if use_cuda:
         criterion = criterion.cuda()
-    print("\n✅ Loaded HYBRID MSFRF-DST loss function.")
+    print("\n Loaded HYBRID MSFRF-DST loss function.")
 
     optim = SGD(model.parameters(), lr=0.25e-3, momentum=0.9, weight_decay=1e-4)
-    print("✅ Optimizer loaded (SGD with momentum).")
+    print("Optimizer loaded (SGD with momentum).")
     print("=" * 80 + "\n")
 
     model.train()
@@ -875,11 +1001,11 @@ def main(use_cuda=True, EPOCHS=200, batch_size=8, model_name="1_hybrid_model.pt"
             if 50 <= epoch < 100:
                 optim = SGD(model.parameters(), lr=0.25e-4, momentum=0.9, weight_decay=1e-4)
                 if epoch == 50:
-                    print(f"📉 Learning rate adjusted to 0.25e-4 at epoch {epoch}")
+                    print(f"Learning rate adjusted to 0.25e-4 at epoch {epoch}")
             if epoch >= 100:
                 optim = SGD(model.parameters(), lr=0.25e-5, momentum=0.9, weight_decay=1e-4)
                 if epoch == 100:
-                    print(f"📉 Learning rate adjusted to 0.25e-5 at epoch {epoch}")
+                    print(f"Learning rate adjusted to 0.25e-5 at epoch {epoch}")
 
             train_losses = LossAverageMeter()
             train_acc = AccAverageMeter()
@@ -887,7 +1013,7 @@ def main(use_cuda=True, EPOCHS=200, batch_size=8, model_name="1_hybrid_model.pt"
             epoch_start_time = time.time()
 
             # 训练阶段
-            print(f"\n{'🚂 TRAINING':<20} Epoch [{epoch + 1}/{EPOCHS}]")
+            print(f"\n{'TRAINING':<20} Epoch [{epoch + 1}/{EPOCHS}]")
             print("-" * 80)
 
             for subepoch, (img, aud, out) in enumerate(dataloader):
@@ -938,11 +1064,11 @@ def main(use_cuda=True, EPOCHS=200, batch_size=8, model_name="1_hybrid_model.pt"
 
             epoch_train_time = time.time() - epoch_start_time
             print("-" * 80)
-            print(f"✅ TRAINING FINISHED | Loss: {train_losses.avg:.4f} | "
+            print(f"TRAINING FINISHED | Loss: {train_losses.avg:.4f} | "
                   f"Acc: {train_acc.getacc():.2f}% | Time: {epoch_train_time:.1f}s")
 
             # 验证阶段
-            print(f"\n{'🔍 VALIDATION':<20} Epoch [{epoch + 1}/{EPOCHS}]")
+            print(f"\n{'VALIDATION':<20} Epoch [{epoch + 1}/{EPOCHS}]")
             print("-" * 80)
 
             val_start_time = time.time()
@@ -998,7 +1124,7 @@ def main(use_cuda=True, EPOCHS=200, batch_size=8, model_name="1_hybrid_model.pt"
 
             val_time = time.time() - val_start_time
             print("-" * 80)
-            print(f"✅ VALIDATION FINISHED | Loss: {val_losses.avg:.4f} | "
+            print(f"VALIDATION FINISHED | Loss: {val_losses.avg:.4f} | "
                   f"Acc: {val_acc.getacc():.2f}% | "
                   f"Avg F1: {avgf1:.4f} | Weighted F1: {weightf1:.4f} | "
                   f"Time: {val_time:.1f}s")
@@ -1014,12 +1140,12 @@ def main(use_cuda=True, EPOCHS=200, batch_size=8, model_name="1_hybrid_model.pt"
             best_avgf1 = max(avgf1, best_avgf1)
             best_weightf1 = max(weightf1, best_weightf1)
 
-            print(f"\n{'📊 BEST METRICS SO FAR':^80}")
+            print(f"\n{'BEST METRICS SO FAR':^80}")
             print("=" * 80)
-            print(f"  🏆 Best Accuracy    : {best_precision:6.2f}%")
-            print(f"  📉 Lowest Loss      : {lowest_loss:6.4f}")
-            print(f"  📈 Best Avg F1      : {best_avgf1:6.4f}")
-            print(f"  🎯 Best Weighted F1 : {best_weightf1:6.4f}")
+            print(f"  Best Accuracy    : {best_precision:6.2f}%")
+            print(f"  Lowest Loss      : {lowest_loss:6.4f}")
+            print(f"  Best Avg F1      : {best_avgf1:6.4f}")
+            print(f"  Best Weighted F1 : {best_weightf1:6.4f}")
             print("=" * 80)
 
             # 保存模型
@@ -1027,28 +1153,28 @@ def main(use_cuda=True, EPOCHS=200, batch_size=8, model_name="1_hybrid_model.pt"
             torch.save(model.state_dict(), save_path)
 
             if is_best:
-                best_path = os.path.join(checkpoint_dir, '1_hybrid_best_model.pt')
+                best_path = os.path.join(checkpoint_dir, '6_hybrid_best_model.pt')
                 shutil.copyfile(save_path, best_path)
-                print(f"🏆 NEW BEST ACCURACY MODEL saved!")
+                print(f"NEW BEST ACCURACY MODEL saved!")
 
             if is_best_avgf1:
-                best_avgf1_path = os.path.join(checkpoint_dir, '1_hybrid_best_avgf1.pt')
+                best_avgf1_path = os.path.join(checkpoint_dir, '6_hybrid_best_avgf1.pt')
                 shutil.copyfile(save_path, best_avgf1_path)
-                print(f"📈 NEW BEST AVG F1 MODEL saved!")
+                print(f"NEW BEST AVG F1 MODEL saved!")
 
     except KeyboardInterrupt:
-        print("\n⚠️  Training interrupted by user")
-        torch.save(model.state_dict(), os.path.join(checkpoint_dir, "1_hybrid_interrupted.pt"))
+        print("\n Training interrupted by user")
+        torch.save(model.state_dict(), os.path.join(checkpoint_dir, "6_hybrid_interrupted.pt"))
 
     finally:
-        print("\n🏁 TRAINING COMPLETED")
+        print("\n TRAINING COMPLETED")
         print(f"Best Accuracy: {best_precision:.2f}%")
         print(f"Best Avg F1: {best_avgf1:.4f}")
 
 
 # ==================== 测试函数 ====================
 def test(use_cuda=True, batch_size=8,
-         model_name=r'/root/1/ERMFNet/model_save/hybrid_model.pt'):
+         model_name=r'/root/1/ERMFNet/model_save/6_hybrid_model.pt'):
     model = getAVENet(use_cuda)
 
     if os.path.exists(model_name):
@@ -1076,7 +1202,7 @@ def test(use_cuda=True, batch_size=8,
     testconfusion = testConfusionMatrix(num_classes=3, labels=labels)
 
     model.eval()
-    print("\n🧪 TESTING...")
+    print("\n TESTING...")
 
     for sepoch, (img, aud, out) in enumerate(testdataloader):
         out = out.squeeze(1)
@@ -1122,6 +1248,7 @@ def test(use_cuda=True, batch_size=8,
     print("=" * 80)
 
     testconfusion.summary()
+
     testconfusion.plot()
 
 
@@ -1138,24 +1265,24 @@ if __name__ == "__main__":
     mode = args.mode
 
     print("=" * 80)
-    print("🚀 HYBRID MSFRF-DST FUSION FOR DRIVING BEHAVIOR RECOGNITION")
+    print(" HYBRID MSFRF-DST FUSION FOR DRIVING BEHAVIOR RECOGNITION")
     print("=" * 80)
     print(f"Mode: {mode}")
     print(f"CUDA Available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
     print("=" * 80)
-    print("\n📋 Model Architecture:")
-    print("  ✅ Main Path: MSFRF Multi-scale Feature Fusion")
-    print("  ✅ Auxiliary Path: DST Evidence Theory")
-    print("  ✅ Adaptive Fusion Strategy")
-    print("  ✅ Uncertainty Quantification")
+    print("\n Model Architecture:")
+    print("   Main Path: MSFRF Multi-scale Feature Fusion")
+    print("   Auxiliary Path: DST Evidence Theory")
+    print("   Adaptive Fusion Strategy")
+    print("   Uncertainty Quantification")
     print("=" * 80)
     print()
 
     if mode == "demo":
         demo()
     elif mode == "main":
-        main(use_cuda=cuda, batch_size=16, EPOCHS=200, model_name="1_hybrid_model.pt")
+        main(use_cuda=cuda, batch_size=16, EPOCHS=200, model_name="6_hybrid_model.pt")
     elif mode == "test":
         test(use_cuda=cuda, batch_size=16)
